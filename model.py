@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from data import load_dataset_and_make_dataloaders
+from PIL import Image
+from torchvision.utils import make_grid
+from matplotlib import pyplot as plt
+import numpy as np
 
 class Model(nn.Module):
     def __init__(
@@ -79,15 +83,14 @@ dl , info = load_dataset_and_make_dataloaders(
 )
 train_load = dl.train #each batch is of size: (400,1,32,32)
 valid_load = dl.valid #each batch is of size: (800,1,32,32)
-
-#For testing if the code works
+Sigma = info.sigma_data #the global standard deviation of the data
+#For testing if the code works (It does)
 model = Model(1,nb_channels=64,num_blocks=3,cond_channels=64)
 optimizer = torch.optim.Adam(model.parameters()) #we'll not specify lr and decay for now
 criterion = nn.MSELoss()
 
 def train_model(model,optimizer,criterion,nb_epochs): #1 epoch took me 450 seconds (around 8 minutes) !
     model.train(True) #We're in training mode
-    norm_distr = torch.distributions.multivariate_normal.MultivariateNormal
     for _ in range(nb_epochs):
         for images,_ in train_load:
             sigma = sample_sigma(1) #sigma is a number
@@ -100,3 +103,51 @@ def train_model(model,optimizer,criterion,nb_epochs): #1 epoch took me 450 secon
             loss.backward()
             optimizer.step()
     model.train(False)
+
+#Task 2 : Build sampling pipeline
+def Denoiser(x,model,sigma_data):
+    cin,cout,cskip,cnoise = sample_constants(sigma_data)
+    input = cin*x
+    output = model(input,cnoise)
+    return cskip*x + cout*output
+
+#How about we modify the function Euler_sampling so that we get also a list of tensors
+#where l[i,j] = the image i at the setp j. the list will be of size : nbr_images*steps
+#each tensor of l holds the images throughout the process
+
+def Euler_sampling(noise,sigmas,model,sigma_data):
+    x = noise.clone()
+    process = [] #the list we talked about
+    for i, sigma in enumerate(sigmas):
+    
+        with torch.no_grad():
+            x_denoised = Denoiser(x,model,sigma_data)  
+        
+        sigma_next = sigmas[i + 1] if i < len(sigmas) - 1 else 0
+        d = (x - x_denoised) / sigma
+    
+        x = x + d * (sigma_next - sigma)  # Perform one step of Euler's method
+        process.append(x) #we add a snapshot of this step to process
+#the output is of the size of the noise. We iteratively apply the denoiser
+    return x,process
+
+def Sampling(nbr_images,model,nbr_steps):
+    sigmas = build_sigma_schedule(steps=nbr_steps) #i'll just keep the setps 50 by default
+    #it returns a tensor with number of steps elements
+    noise = torch.randn(size=(nbr_images,1,32,32)) * sigmas[0]
+    images,_ = Euler_sampling(noise,sigmas,model,Sigma)
+    return images
+noise = torch.randn(size=(3,1,32,32))
+sigmas = sample_sigma(20)
+x , proc = Euler_sampling(noise,sigmas,model,Sigma)
+print(x.shape,proc[0].shape)
+
+#We visualize the denoising process using the process output from the Euler_sampling function
+import time
+def visualize_process(t):
+    for x in t:
+        x = x.clamp(-1, 1).add(1).div(2).mul(255).byte()  # [-1., 1.] -> [0., 1.] -> [0, 255]
+        x = make_grid(x)
+        x = Image.fromarray(x.permute(1, 2, 0).cpu().numpy())
+        x.show()
+        time.sleep(10) #we wait 10 seconds to display each photo
