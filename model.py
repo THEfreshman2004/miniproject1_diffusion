@@ -53,8 +53,8 @@ class ResidualBlock(nn.Module):
 def sample_sigma(n, loc=-1.2, scale=1.2, sigma_min=2e-3, sigma_max=80): #it samples sigma for size n=1 (scalar)
     return (torch.randn(n) * scale + loc).exp().clip(sigma_min, sigma_max)
 
-def sample_constants(data,sigma_data): #It return c_in,c_out,c_skip and c_noise
-    sigma = sample_sigma(data.shape[0]) #sigma has the same size as the number of images in our batch
+def sample_constants(sigma_data): #It return c_in,c_out,c_skip and c_noise
+    sigma = sample_sigma(1) #sigma has the same size as the number of images in our batch
 
     c_in = 1/(torch.sqrt((sigma_data**2 + sigma)))
     c_out = (sigma*sigma_data)/(sigma**2+sigma_data**2)
@@ -70,7 +70,7 @@ def build_sigma_schedule(steps, rho=7, sigma_min=2e-3, sigma_max=80):
     sigmas = (max_inv_rho + torch.linspace(0, 1, steps) * (min_inv_rho - max_inv_rho)) ** rho
     return sigmas
 
-#Training process (Task 1):
+#Training process(FashionMNIST) (Task 1):
 dl , info = load_dataset_and_make_dataloaders(
     dataset_name='FashionMNIST',
     root_dir='data', # choose the directory to store the data 
@@ -80,4 +80,23 @@ dl , info = load_dataset_and_make_dataloaders(
 train_load = dl.train #each batch is of size: (400,1,32,32)
 valid_load = dl.valid #each batch is of size: (800,1,32,32)
 
+#For testing if the code works
 model = Model(1,nb_channels=64,num_blocks=3,cond_channels=64)
+optimizer = torch.optim.Adam(model.parameters()) #we'll not specify lr and decay for now
+criterion = nn.MSELoss()
+
+def train_model(model,optimizer,criterion,nb_epochs): #1 epoch took me 450 seconds (around 8 minutes) !
+    model.train(True) #We're in training mode
+    norm_distr = torch.distributions.multivariate_normal.MultivariateNormal
+    for _ in range(nb_epochs):
+        for images,_ in train_load:
+            sigma = sample_sigma(1) #sigma is a number
+            noise = torch.randn_like(images)*sigma*images
+            noisy_batch = images + noise
+            c_in,c_out,c_skip,cnoise = sample_constants(torch.std(images))
+            output = model(c_in*noisy_batch,cnoise)
+            loss = criterion(output,(images-c_skip*noisy_batch)/c_out)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+    model.train(False)
