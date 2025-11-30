@@ -13,20 +13,22 @@ class Model(nn.Module):
         image_channels: int,
         nb_channels: int,
         num_blocks: int,
-        cond_channels: int,
+        cond_channels: int #Better to be even, 
     ) -> None:
         super().__init__()
         self.noise_emb = NoiseEmbedding(cond_channels)
         self.conv_in = nn.Conv2d(image_channels, nb_channels, kernel_size=3, padding=1)
+        self.batch = conditional_BN(num_channels=image_channels,cond_channels=cond_channels)
         self.blocks = nn.ModuleList([ResidualBlock(nb_channels) for _ in range(num_blocks)])
         self.conv_out = nn.Conv2d(nb_channels, image_channels, kernel_size=3, padding=1)
     
     def forward(self, noisy_input: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
-        cond = self.noise_emb(c_noise) # TODO: not used yet
+        cond = self.noise_emb(c_noise) # TODO: not used yet. It has shape (1,cond_channels // 2)
         x = self.conv_in(noisy_input)
         for block in self.blocks:
             x = block(x)
-        return self.conv_out(x)
+        x = self.conv_out(x)
+        return self.batch(x,cond) #We normalize after the last convolutional layer
 
 
 class NoiseEmbedding(nn.Module):
@@ -53,6 +55,21 @@ class ResidualBlock(nn.Module):
         y = self.conv1(F.relu(self.norm1(x)))
         y = self.conv2(F.relu(self.norm2(y)))
         return x + y
+
+class conditional_BN(nn.Module): #The idea is to have regular batchNorm with no coefficients (affine = False)
+    #And then we modify the output using our own predicted affine parameters
+    def __init__(self,num_channels,cond_channels):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(num_channels,affine=False)
+        self.lin = nn.Linear(cond_channels,2*num_channels) #MLP that predicts the affine parameters
+        #We need a gamma and a beta for each channel, that's why we have 2*num_channels
+    def forward(self,x,cond): #cond:noise conditioning
+        x = self.bn(x)
+        out = self.lin(cond) #instead of having out with shape (1,2) we have (2,)
+        gamma,beta = out.chunk(2,dim=-1) #We split the output since we have 2*num_channels
+        gamma = gamma[:,:,None,None] #We do this to make the coefficients broadcastable when manipluating them with x
+        beta = beta[:,:,None,None] #this has the same effect as doing unsqueeze multiple times
+        return gamma * x + beta
 
 def sample_sigma(n, loc=-1.2, scale=1.2, sigma_min=2e-3, sigma_max=80): #it samples sigma for size n=1 (scalar)
     return (torch.randn(n) * scale + loc).exp().clip(sigma_min, sigma_max)
@@ -103,7 +120,7 @@ def train_model(model,optimizer,criterion,nb_epochs): #1 epoch took me 450 secon
             loss.backward()
             optimizer.step()
     model.train(False)
-
+train_model(model,optimizer,criterion,1)
 #Task 2 : Build sampling pipeline
 def Denoiser(x,model,sigma_data):
     cin,cout,cskip,cnoise = sample_constants(sigma_data)
@@ -137,10 +154,7 @@ def Sampling(nbr_images,model,nbr_steps):
     noise = torch.randn(size=(nbr_images,1,32,32)) * sigmas[0]
     images,_ = Euler_sampling(noise,sigmas,model,Sigma)
     return images
-noise = torch.randn(size=(3,1,32,32))
-sigmas = sample_sigma(20)
-x , proc = Euler_sampling(noise,sigmas,model,Sigma)
-print(x.shape,proc[0].shape)
+
 
 #We visualize the denoising process using the process output from the Euler_sampling function
 import time
@@ -151,3 +165,6 @@ def visualize_process(t):
         x = Image.fromarray(x.permute(1, 2, 0).cpu().numpy())
         x.show()
         time.sleep(10) #we wait 10 seconds to display each photo
+
+#Task 3 (Improving the architecture) #The conditional batch normalization works
+
