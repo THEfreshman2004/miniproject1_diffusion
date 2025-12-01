@@ -13,7 +13,9 @@ class Model(nn.Module):
         image_channels: int,
         nb_channels: int,
         num_blocks: int,
-        cond_channels: int #Better to be even, 
+        cond_channels: int, #Better to be even, 
+        nbr_classes : int,
+        null_init = False #It declares if we want to choose null initialisation or not
     ) -> None:
         super().__init__()
         self.noise_emb = NoiseEmbedding(cond_channels)
@@ -21,14 +23,67 @@ class Model(nn.Module):
         self.batch = conditional_BN(num_channels=image_channels,cond_channels=cond_channels)
         self.blocks = nn.ModuleList([ResidualBlock(nb_channels) for _ in range(num_blocks)])
         self.conv_out = nn.Conv2d(nb_channels, image_channels, kernel_size=3, padding=1)
+        
+        
+        #class conditioning:
+        self.class_embed = nn.Embedding(nbr_classes,cond_channels)
+
+        if null_init:
+            #Null initialisation for conv_out:
+            nn.init.zeros_(self.conv_out.weight)
+            if self.conv_in.bias is not None:
+                nn.init.zeros_(self.conv_out.bias)
+            
+            #Null initialisation for resBlocks:
+            for block in self.blocks:
+                for m in block.modules():
+                    if isinstance(m,nn.Conv2d):
+                        nn.init.zeros_(m.weight)
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
     
-    def forward(self, noisy_input: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
-        cond = self.noise_emb(c_noise) # TODO: not used yet. It has shape (1,cond_channels // 2)
+    def forward(self, noisy_input: torch.Tensor, c_noise: torch.Tensor,clas : int) -> torch.Tensor:
+        cond = self.noise_emb(c_noise) #It has shape (1,cond_channels // 2)
+        cond_noise = self.noise_emb(c_noise) # It has shape (1,cond_channels)
+        cond_class = self.class_embed(torch.tensor([clas],dtype=torch.long)) #class embedding shape (1,cond_channels)
+        cond = cond_class + cond_noise
         x = self.conv_in(noisy_input)
         for block in self.blocks:
             x = block(x)
         x = self.conv_out(x)
         return self.batch(x,cond) #We normalize after the last convolutional layer
+
+class Model_zeroInit(nn.Module):
+    def __init__(
+        self,
+        image_channels: int,
+        nb_channels: int,
+        num_blocks: int,
+        cond_channels: int, #Better to be even,
+        nbr_classes : int
+    ) -> None:
+        super().__init__()
+        self.noise_emb = NoiseEmbedding(cond_channels)
+        self.conv_in = nn.Conv2d(image_channels, nb_channels, kernel_size=3, padding=1)
+        self.batch = conditional_BN(num_channels=image_channels,cond_channels=cond_channels)
+        self.blocks = nn.ModuleList([ResidualBlock(nb_channels) for _ in range(num_blocks)])
+        self.conv_out = nn.Conv2d(nb_channels, image_channels, kernel_size=3, padding=1)
+        
+        #Class conditioning:
+        self.class_emb = nn.Embedding(nbr_classes,cond_channels)
+
+        
+    
+    def forward(self, noisy_input: torch.Tensor, c_noise: torch.Tensor,clas : int) -> torch.Tensor:
+        cond_noise = self.noise_emb(c_noise) # It has shape (1,cond_channels)
+        cond_class = self.class_emb(torch.tensor([clas],dtype=torch.long)) #class embedding shape (1,cond_channels)
+        cond = cond_class + cond_noise
+        x = self.conv_in(noisy_input)
+        for block in self.blocks:
+            x = block(x)
+        x = self.conv_out(x)
+        return self.batch(x,cond) #We normalize after the last convolutional layer
+
 
 
 class NoiseEmbedding(nn.Module):
@@ -65,7 +120,7 @@ class conditional_BN(nn.Module): #The idea is to have regular batchNorm with no 
         #We need a gamma and a beta for each channel, that's why we have 2*num_channels
     def forward(self,x,cond): #cond:noise conditioning
         x = self.bn(x)
-        out = self.lin(cond) #instead of having out with shape (1,2) we have (2,)
+        out = self.lin(cond)
         gamma,beta = out.chunk(2,dim=-1) #We split the output since we have 2*num_channels
         gamma = gamma[:,:,None,None] #We do this to make the coefficients broadcastable when manipluating them with x
         beta = beta[:,:,None,None] #this has the same effect as doing unsqueeze multiple times
@@ -101,11 +156,31 @@ dl , info = load_dataset_and_make_dataloaders(
 train_load = dl.train #each batch is of size: (400,1,32,32)
 valid_load = dl.valid #each batch is of size: (800,1,32,32)
 Sigma = info.sigma_data #the global standard deviation of the data
+
 #For testing if the code works (It does)
-model = Model(1,nb_channels=64,num_blocks=3,cond_channels=64)
+model = Model_zeroInit(1,nb_channels=64,num_blocks=3,cond_channels=64,nbr_classes=10)
 optimizer = torch.optim.Adam(model.parameters()) #we'll not specify lr and decay for now
 criterion = nn.MSELoss()
 
+"""
+#Let's get a single batch to test if the model works:
+batch1,_ = next(iter(train_load)) #Get only one batch from the train_load
+sigma = sample_sigma(1) #sigma is a number
+noise = torch.randn_like(batch1)*sigma*batch1
+noisy_batch = batch1 + noise
+c_in,c_out,c_skip,cnoise = sample_constants(torch.std(batch1))
+output = model(c_in*noisy_batch,cnoise,clas=3) 
+#Our fw pass works
+
+#Let's check the bw pass:
+loss = criterion(output,(batch1-c_skip*noisy_batch)/c_out)
+optimizer.zero_grad()
+loss.backward()
+optimizer.step() #It works as well
+
+#So the whole model works fine 
+
+"""
 def train_model(model,optimizer,criterion,nb_epochs): #1 epoch took me 450 seconds (around 8 minutes) !
     model.train(True) #We're in training mode
     for _ in range(nb_epochs):
@@ -120,7 +195,7 @@ def train_model(model,optimizer,criterion,nb_epochs): #1 epoch took me 450 secon
             loss.backward()
             optimizer.step()
     model.train(False)
-train_model(model,optimizer,criterion,1)
+
 #Task 2 : Build sampling pipeline
 def Denoiser(x,model,sigma_data):
     cin,cout,cskip,cnoise = sample_constants(sigma_data)
@@ -149,11 +224,11 @@ def Euler_sampling(noise,sigmas,model,sigma_data):
     return x,process
 
 def Sampling(nbr_images,model,nbr_steps):
-    sigmas = build_sigma_schedule(steps=nbr_steps) #i'll just keep the setps 50 by default
+    sigmas = build_sigma_schedule(steps=nbr_steps) 
     #it returns a tensor with number of steps elements
     noise = torch.randn(size=(nbr_images,1,32,32)) * sigmas[0]
-    images,_ = Euler_sampling(noise,sigmas,model,Sigma)
-    return images
+    images,process = Euler_sampling(noise,sigmas,model,Sigma)
+    return images,process  
 
 
 #We visualize the denoising process using the process output from the Euler_sampling function
@@ -166,5 +241,5 @@ def visualize_process(t):
         x.show()
         time.sleep(10) #we wait 10 seconds to display each photo
 
-#Task 3 (Improving the architecture) #The conditional batch normalization works
+
 
