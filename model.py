@@ -216,6 +216,23 @@ def visualize_images(images):
         plt.axis("off")
         plt.show()
 
+####### Testing
+m = Model().to(device)
+o = torch.optim.AdamW(m.parameters(),lr=0.0001)
+c = nn.MSELoss()
+
+nb_epochs = 60
+loss_list = train_model(m,o,c,nb_epochs)
+
+plt.plot(np.arange(nb_epochs),loss_list,marker='o')
+plt.xlabel('epoch number')
+plt.ylabel('loss')
+plt.title('The evolution of the loss through the epochs')
+plt.show()
+
+clas = torch.tensor(5,dtype=torch.long,device=device)
+images,_ = Sampling(5,m,50,)
+visualize_images(images)
 
 
 
